@@ -1,0 +1,401 @@
+---
+title: "TidyTemplate"
+date: 2020-09-23
+output: html_output
+editor_options: 
+  chunk_output_type: console
+---
+
+# TidyTuesday
+
+Join the R4DS Online Learning Community in the weekly #TidyTuesday event!
+Every week we post a raw dataset, a chart or article related to that dataset, and ask you to explore the data.
+While the dataset will be “tamed”, it will not always be tidy! As such you might need to apply various R for Data Science techniques to wrangle the data into a true tidy format.
+The goal of TidyTuesday is to apply your R skills, get feedback, explore other’s work, and connect with the greater #RStats community!
+As such we encourage everyone of all skills to participate!
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidytuesdayR)
+library(tidymodels)
+theme_set(theme_minimal())
+
+```
+
+## Load and Explore Data
+
+```{r Load}
+## Download and explore data
+
+tt <- tt_load("2020-09-22")
+
+climbers <- tt$members
+
+
+climbers %>%
+  group_by(peak_name) %>%
+  summarise(death_rate = mean(died == TRUE),
+            total_climbs = n()) %>%
+  arrange(desc(death_rate)) %>%
+  filter(death_rate < .8) %>%
+  ggplot(aes(x = total_climbs, y = death_rate)) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label = if_else(death_rate > .05 | total_climbs > 500, peak_name, ""))) +
+  scale_x_log10() +
+  scale_y_continuous(label = scales::percent_format()) +
+  labs(y = "Death Rate", x = "Number of Climbers", title = "Mortality Rate of Himalayan Mountains")
+```
+
+
+```{r Load}
+climbers %>%
+  group_by(expedition_role) %>%
+  summarise(death_rate = mean(died == TRUE),
+            total_climbs = n()) %>%
+  arrange(desc(death_rate)) %>%
+  filter(death_rate < .8) %>%
+  ggplot(aes(x = total_climbs, y = death_rate)) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label = if_else(death_rate > .1 | total_climbs > 100, expedition_role, ""))) +
+  scale_x_log10() +
+  scale_y_continuous(label = scales::percent_format()) +
+  labs(y = "Death Rate", x = "Number of Climbers", title = "Mortality Rate by Expedition Role")
+```
+
+
+```{r Load}
+climbers %>%
+  group_by(citizenship) %>%
+  summarise(death_rate = mean(died == TRUE),
+            total_climbs = n()) %>%
+  arrange(desc(death_rate)) %>%
+  filter(death_rate < .8) %>%
+  ggplot(aes(x = total_climbs, y = death_rate)) +
+  geom_point() +
+  ggrepel::geom_text_repel(aes(label = if_else(death_rate > .025 | total_climbs >1000, citizenship, ""))) +
+  scale_x_log10() +
+  scale_y_continuous(label = scales::percent_format()) +
+  labs(y = "Death Rate", x = "Number of Climbers", title = "Mortality Rate by Citizenship")
+```
+
+
+```{r Load}
+climbers %>%
+  filter(season != "Unknown",
+         year >= 1950) %>%
+  mutate(decade = 10 * (year %/% 10)) %>%
+  group_by(decade,season) %>%
+  summarise(death_rate = mean(died == TRUE),
+            total_climbs = n()) %>%
+  filter(death_rate < .2) %>%
+  ggplot(aes(x = decade, y = death_rate)) +
+  geom_point(aes(size = total_climbs)) +
+  geom_line() +
+  facet_wrap(~season) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Decade", y = "Death Rate", size = "Total Climbers", title = "Mortality Rate of Himalayan Mountain Climbers Over Time")
+
+
+```
+
+
+## Preprocessing for Modeling
+
+```{r}
+library(tidymodels)
+
+
+climbers_model <- climbers %>%
+  select(age,peak_name, year, season, sex, citizenship, expedition_role, hired, solo, oxygen_used, died) %>%
+  mutate(died = if_else(died == TRUE, "died","survived")) %>%
+  mutate(across(where(is.logical),as.numeric)) %>%
+  mutate(across(where(is.character),as.factor)) %>%
+  filter(!is.na(peak_name),
+         !is.na(citizenship),
+         !is.na(sex),
+         !is.na(expedition_role))
+
+
+map(climbers_model, ~sum(is.na(.)))
+
+
+set.seed(1988)
+
+climbers_split = rsample::initial_split(climbers_model, strata = died)
+climbers_train <- rsample::training(climbers_split)
+climbers_test <- rsample::testing(climbers_split)
+
+climber_folds <- rsample::vfold_cv(data = climbers_train, strata = died)
+```
+
+GLMNET Model
+
+```{r}
+library(themis)
+
+usemodels::use_glmnet(died ~ ., data = climbers_train)
+
+
+glmnet_recipe <-
+  recipe(formula = died ~ ., data = climbers_train) %>%
+  step_medianimpute(age) %>%
+  step_other(peak_name, citizenship, expedition_role) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors(), -all_nominal()) %>%
+  step_upsample(died)
+
+
+glmnet_spec <-
+  logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+glmnet_workflow <-
+  workflow() %>%
+  add_recipe(glmnet_recipe) %>%
+  add_model(glmnet_spec)
+
+glmnet_grid <- tidyr::crossing(penalty = 10^seq(-6, -1, length.out = 20),
+                               mixture = c(0.05, 0.2, 0.4, 0.6, 0.8, 1))
+
+
+
+
+library(doParallel)
+registerDoParallel()
+
+
+glmnet_tune <-
+  tune_grid(glmnet_workflow,
+            resamples = climber_folds,
+            grid = glmnet_grid,
+            control = control_grid(save_pred = TRUE))
+
+
+
+autoplot(glmnet_tune)
+
+best_glmnet <-  select_best(glmnet_tune, metric = "roc_auc")
+
+collect_predictions(glmnet_tune) %>%
+  inner_join(best_glmnet, by = c("penalty","mixture"))
+
+glmnet_pred <- collect_predictions(glmnet_tune) %>%
+  inner_join(best_glmnet, by = c("penalty","mixture"))
+
+glmnet_pred %>%
+  group_by(id) %>%
+  roc_curve(died, .pred_died) %>%
+  autoplot()
+
+
+glmnet_pred %>%
+  conf_mat(died, .pred_class)
+
+
+
+
+```
+
+
+Random Forest model
+
+```{r}
+
+
+usemodels::use_ranger(died ~., data = climbers_train)
+
+
+ranger_recipe <-
+  recipe(formula = died ~ ., data = climbers_train) %>%
+  step_medianimpute(age) %>%
+  step_other(peak_name, citizenship, expedition_role) %>%
+  step_upsample(died)
+
+
+
+ranger_spec <-
+  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+  set_mode("classification") %>%
+  set_engine("ranger")
+
+ranger_workflow <-
+  workflow() %>%
+  add_recipe(ranger_recipe) %>%
+  add_model(ranger_spec)
+
+
+ranger_grid <- grid_max_entropy(min_n(), finalize(mtry(), climbers_train), size = 6)
+
+set.seed(60402)
+
+
+
+ranger_tune <-
+  tune_grid(ranger_workflow,
+            resamples = climber_folds,
+            grid = ranger_grid,
+            control = control_grid(save_pred = TRUE))
+
+
+
+ranger_tune %>%
+  collect_metrics() %>%
+  arrange(desc(mean))
+
+autoplot(ranger_tune)
+
+## Get best model and perform resampling
+
+best_ranger <-  select_best(ranger_tune, metric = "roc_auc")
+
+ranger_pred <- collect_predictions(ranger_tune) %>%
+  inner_join(best_ranger, by = c("min_n", "mtry"))
+
+ranger_pred %>%
+  group_by(id) %>%
+  roc_curve(died, .pred_died) %>%
+  autoplot()
+
+ranger_pred %>%
+  conf_mat(died, .pred_class)
+
+
+
+```
+
+
+earth model
+
+```{r}
+
+usemodels::use_earth(died ~ ., data = climbers_train)
+
+earth_recipe <-
+  recipe(formula = died ~ ., data = climbers_train) %>%
+  step_medianimpute(age) %>%
+  step_other(peak_name, citizenship, expedition_role) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_smote(died)
+
+
+earth_spec <-
+  mars(num_terms = tune(), prod_degree = tune(), prune_method = "none") %>%
+  set_mode("classification") %>%
+  set_engine("earth")
+
+earth_workflow <-
+  workflow() %>%
+  add_recipe(earth_recipe) %>%
+  add_model(earth_spec)
+
+earth_grid <- tidyr::crossing(num_terms = 2 * (1:6),
+                              prod_degree = 1:2)
+
+
+
+earth_tune <-
+  tune_grid(earth_workflow,
+            resamples = climber_folds,
+            grid = earth_grid,
+            control = control_grid(save_pred = T))
+
+
+
+collect_metrics(earth_tune) %>%
+  arrange(desc(mean))
+
+autoplot(earth_tune)
+
+best_earth <-  select_best(earth_tune, metric = "roc_auc")
+
+earth_pred <- collect_predictions(earth_tune) %>%
+  inner_join(best_earth, by = c("num_terms", "prod_degree"))
+
+earth_pred %>%
+  group_by(id) %>%
+  roc_curve(died, .pred_died) %>%
+  autoplot()
+
+earth_pred %>%
+  conf_mat(died, .pred_class)
+
+```
+
+```{r}
+
+usemodels::use_xgboost(died ~ ., data = climbers_train)
+
+xgboost_recipe <-
+  recipe(formula = died ~ ., data = climbers_train) %>%
+  step_medianimpute(age) %>%
+  step_other(peak_name, citizenship, expedition_role) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>%
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>%
+  step_zv(all_predictors()) %>%
+  themis::step_upsample(died)
+
+
+
+xgboost_spec <-
+  boost_tree(trees = 1000, min_n = tune(), tree_depth = tune(), mtry = tune(),
+             learn_rate = tune(), loss_reduction = tune(), sample_size = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("xgboost")
+
+xgboost_workflow <-
+  workflow() %>%
+  add_recipe(xgboost_recipe) %>%
+  add_model(xgboost_spec)
+
+xgboost_grid <-  grid_max_entropy( min_n(), tree_depth(), finalize(mtry(),climbers_train),
+             learn_rate(), loss_reduction(), sample_size = sample_prop(), size = 20)
+
+
+set.seed(36923)
+
+library(doParallel)
+registerDoParallel()
+
+
+xgboost_tune <-
+  tune_grid(xgboost_workflow,
+            resamples = climber_folds,
+            grid = xgboost_grid,
+            control = control_grid(save_pred = T))
+
+
+
+collect_metrics(xgboost_tune) %>%
+  arrange(desc(mean))
+
+autoplot(xgboost_tune)
+
+best_xgboost <-  select_best(xgboost_tune, metric = "roc_auc")
+
+xgboost_pred <- collect_predictions(xgboost_tune) %>%
+  inner_join(best_xgboost, by = c("mtry",
+                                  "min_n",
+                                  "tree_depth",
+                                  "learn_rate",
+                                  "loss_reduction",
+                                  "sample_size"))
+
+xgboost_pred %>%
+  group_by(id) %>%
+  roc_curve(died, .pred_died) %>%
+  autoplot()
+
+xgboost_pred %>%
+  conf_mat(died, .pred_class)
+
+save.image(file = "climbers_tidymodels.RData")
+
+```
